@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Editar Medicamento</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+  <div class="container mt-4">
+    <h2>Editando: <span class="text-primary">{{ medicamento.nombre_comercial }}</span></h2>
+    <p>ID Alfabeta: {{ medicamento.id_alfabeta }}</p>
+
+    <form method="post">
+      {% csrf_token %} <div class="card mb-4">
+        <div class="card-header">Datos del Medicamento</div>
+        <div class="card-body">
+          {{ medicamento_form.as_p }}
+        </div>
+      </div>
+
+      <div class="card mb-4">
+        <div class="card-header">Códigos de Equivalencia</div>
+        <div class="card-body">
+          {{ equivalencia_form.as_p }}
+        </div>
+      </div>
+
+      <button type="submit" class="btn btn-success">Guardar Cambios</button>
+      <a href="{% url 'lista_medicamentos' %}" class="btn btn-secondary">Cancelar</a>
+    </form>
+  </div>
+</body>
+</html>
