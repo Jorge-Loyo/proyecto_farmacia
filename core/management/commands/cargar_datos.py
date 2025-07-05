@@ -1,66 +1,85 @@
 import pandas as pd
 from django.core.management.base import BaseCommand
-from core.models import Laboratorio, Monodroga, Medicamento, Equivalencia
 from django.db import transaction
+from django.utils import timezone
+from decimal import Decimal
+
+# Importa todos los modelos y la excepción personalizada
+from core.models import Laboratorio, Monodroga, Medicamento, Equivalencia, RegistroCarga, HistorialPrecio
+
+class CargaDatosException(Exception):
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__("Errores de validación durante la carga.")
 
 class Command(BaseCommand):
-    help = 'Carga, limpia y relaciona datos desde un archivo XLSX.'
+    help = 'Actualiza y valida registros desde el archivo XLSX, protegiendo la cantidad y calculando precios.'
 
     def handle(self, *args, **kwargs):
         file_path = 'data/ALFABETA PUBLICADO EN OCTUBRE.xlsx'
-        self.stdout.write(self.style.SUCCESS('Iniciando carga final de datos...'))
+        
+        # 1. Cargar DataFrames
+        df_lab = pd.read_excel(file_path, sheet_name='Laboratorio').dropna(subset=['Codigo']).drop_duplicates(subset=['Codigo'])
+        df_mono = pd.read_excel(file_path, sheet_name='Monodroga').dropna(subset=['Cod Monodroga', 'buscar']).drop_duplicates(subset=['buscar'])
+        df_med = pd.read_excel(file_path, sheet_name='Medicamentos').dropna(subset=['Cod Alfabeta'])
 
-        # --- 1. PREPARACIÓN DE DATOS ---
-        df_lab = pd.read_excel(file_path, sheet_name='Laboratorio').dropna(subset=['Codigo', 'Descripcion']).drop_duplicates(subset=['Codigo'], keep='first')
-        
-        # Limpia monodrogas por nombre, pero guarda un mapa para resolver relaciones rotas
-        df_mono_original = pd.read_excel(file_path, sheet_name='Monodroga').dropna(subset=['Cod Monodroga', 'buscar'])
-        df_mono_limpio = df_mono_original.drop_duplicates(subset=['buscar'], keep='first')
-        
-        mapa_id_a_nombre = df_mono_original.set_index('Cod Monodroga')['buscar']
-        mapa_nombre_a_id_canonico = df_mono_limpio.set_index('buscar')['Cod Monodroga']
-        
-        df_med = pd.read_excel(file_path, sheet_name='Medicamentos').dropna(subset=['Cod Alfabeta', 'Cod Laboratorio', 'Cod Monodroga']).drop_duplicates(subset=['Cod Alfabeta'], keep='first')
+        # 2. Validar el archivo Excel antes de tocar la base de datos
+        validation_errors = []
+        lab_ids_validos = set(df_lab['Codigo'].astype(int))
+        mono_ids_validos = set(df_mono['Cod Monodroga'].astype(int))
 
+        for index, row in df_med.iterrows():
+            if int(row['Cod Laboratorio']) not in lab_ids_validos:
+                validation_errors.append(f"Fila {index+2} (Medicamentos): El Laboratorio con código {int(row['Cod Laboratorio'])} no existe en la hoja 'Laboratorio'.")
+            if int(row['Cod Monodroga']) not in mono_ids_validos:
+                validation_errors.append(f"Fila {index+2} (Medicamentos): La Monodroga con código {int(row['Cod Monodroga'])} no existe en la hoja 'Monodroga'.")
+
+        if validation_errors:
+            raise CargaDatosException(validation_errors)
+
+        # 3. Iniciar transacción en la base de datos
         with transaction.atomic():
-            self.stdout.write(self.style.WARNING('Limpiando tablas para la carga final...'))
-            Equivalencia.objects.all().delete()
-            Medicamento.objects.all().delete()
-            Monodroga.objects.all().delete()
-            Laboratorio.objects.all().delete()
+            # Sincronizar Laboratorios y Monodrogas
+            for _, row in df_lab.iterrows():
+                Laboratorio.objects.update_or_create(id=int(row['Codigo']), defaults={'nombre': row['Descripcion']})
+            for _, row in df_mono.iterrows():
+                Monodroga.objects.update_or_create(id=int(row['Cod Monodroga']), defaults={'nombre': row['buscar']})
 
-            # --- 2. CARGA MASIVA ---
-            Laboratorio.objects.bulk_create([Laboratorio(id=row['Codigo'], nombre=row['Descripcion']) for _, row in df_lab.iterrows()])
-            self.stdout.write(self.style.SUCCESS(f'{Laboratorio.objects.count()} laboratorios cargados.'))
-            
-            Monodroga.objects.bulk_create([Monodroga(id=row['Cod Monodroga'], nombre=row['buscar']) for _, row in df_mono_limpio.iterrows()])
-            self.stdout.write(self.style.SUCCESS(f'{Monodroga.objects.count()} monodrogas únicas cargadas.'))
-
-            medicamentos_para_crear = []
+            nuevos = 0
+            actualizados = 0
             for _, row in df_med.iterrows():
                 try:
-                    # Lógica para resolver relaciones rotas
-                    nombre_mono = mapa_id_a_nombre[row['Cod Monodroga']]
-                    id_mono_final = mapa_nombre_a_id_canonico[nombre_mono]
+                    medicamento = Medicamento.objects.get(pk=int(row['Cod Alfabeta']))
+                    
+                    # SI EXISTE: Lógica de Actualización
+                    medicamento.nombre_comercial = row['Marca +Presenta']
+                    medicamento.laboratorio_id = int(row['Cod Laboratorio'])
+                    medicamento.monodroga_id = int(row['Cod Monodroga'])
+                    medicamento.precio_caja = Decimal(str(row['Precio x Caja']).replace(',', '.'))
+                    medicamento.estado = int(row.get('Cod AB', 0))
+                    
+                    # Condición para la cantidad (con la indentación correcta)
+                    if not medicamento.cantidad:
+                        medicamento.cantidad = int(row.get('Cantidad', 1))
+                    
+                    medicamento.save()
+                    actualizados += 1
 
-                    medicamentos_para_crear.append(
-                        Medicamento(
-                            id_alfabeta=int(row['Cod Alfabeta']),
-                            nombre_comercial=row['Marca +Presenta'],
-                            laboratorio_id=int(row['Cod Laboratorio']),
-                            monodroga_id=int(id_mono_final), # Se usa el ID limpio
-                            precio_caja=float(str(row['Precio x Caja']).replace(',', '.')),
-                            precio_unitario=float(str(row['Precio Unitario']).replace(',', '.'))
-                        )
+                except Medicamento.DoesNotExist:
+                    # SI NO EXISTE: Lógica de Creación
+                    nuevo_medicamento = Medicamento(
+                        id_alfabeta=int(row['Cod Alfabeta']),
+                        nombre_comercial=row['Marca +Presenta'],
+                        laboratorio_id=int(row['Cod Laboratorio']),
+                        monodroga_id=int(row['Cod Monodroga']), # <-- Esta línea faltaba en tu código
+                        precio_caja=Decimal(str(row['Precio x Caja']).replace(',', '.')),
+                        estado=int(row.get('Cod AB', 0)),
+                        cantidad=int(row.get('Cantidad', 1))
                     )
-                except KeyError:
-                    # Si un medicamento apunta a un laboratorio o monodroga que no existe en sus respectivas hojas, se ignora.
-                    continue
+                    nuevo_medicamento.save()
+                    Equivalencia.objects.create(medicamento_alfabeta=nuevo_medicamento)
+                    HistorialPrecio.objects.create(medicamento=nuevo_medicamento, precio_caja=nuevo_medicamento.precio_caja, precio_unitario=nuevo_medicamento.precio_unitario)
+                    nuevos += 1
             
-            Medicamento.objects.bulk_create(medicamentos_para_crear, ignore_conflicts=True)
-            self.stdout.write(self.style.SUCCESS(f'{Medicamento.objects.count()} medicamentos cargados.'))
-
-            Equivalencia.objects.bulk_create([Equivalencia(medicamento_alfabeta=med) for med in Medicamento.objects.all()], ignore_conflicts=True)
-            self.stdout.write(self.style.SUCCESS(f'{Equivalencia.objects.count()} equivalencias creadas.'))
-
-        self.stdout.write(self.style.SUCCESS('¡ÉXITO TOTAL! Los datos han sido cargados.'))
+            self.stdout.write(self.style.SUCCESS(f'Sincronización completa: {nuevos} medicamentos creados, {actualizados} actualizados.'))
+            RegistroCarga.objects.update_or_create(fuente='ALFABETA', defaults={'fecha_carga': timezone.now()})
